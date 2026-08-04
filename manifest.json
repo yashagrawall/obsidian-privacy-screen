@@ -1,7 +1,7 @@
 {
 	"id": "privacy-screen",
 	"name": "Privacy Screen",
-	"version": "0.1.2",
+	"version": "0.2.0",
 	"minAppVersion": "1.5.0",
 	"description": "Blur your workspace while keeping a spotlight around your cursor.",
 	"author": "chanhee-lee",
