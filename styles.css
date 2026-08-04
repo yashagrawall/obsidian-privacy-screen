@@ -74,3 +74,11 @@
 .privacy-preview-cursor.no-blink {
 	animation: none;
 }
+
+.privacy-number-input {
+	width: 60px;
+}
+
+.side-dock-ribbon-action.is-active {
+	color: var(--interactive-accent);
+}

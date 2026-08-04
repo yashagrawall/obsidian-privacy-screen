@@ -1,4 +1,4 @@
-import { Plugin, MarkdownView, PluginSettingTab, App, Setting } from 'obsidian';
+import { Plugin, MarkdownView, PluginSettingTab, App, Setting, SliderComponent, TextComponent, setIcon } from 'obsidian';
 import { EditorView } from '@codemirror/view';
 
 type SpotlightShape = 'circle' | 'square';
@@ -35,18 +35,25 @@ export default class PrivacyScreenPlugin extends Plugin {
 	private overlayEl: HTMLElement | null = null;
 	private isActive: boolean = false;
 	private wasActiveBeforePause: boolean = false;
+	private ribbonIconEl: HTMLElement | null = null;
+	private pendingMouseX: number = 0;
+	private pendingMouseY: number = 0;
+	private mouseMoveRaf: number | null = null;
 
 	async onload() {
 		await this.loadSettings();
 
-		// Restore state from last session
-		if (this.settings.wasActive) {
-			this.createOverlay();
-			this.isActive = true;
-		}
+		// Restore state from last session, once panes exist to track a cursor in
+		this.app.workspace.onLayoutReady(() => {
+			if (this.settings.wasActive) {
+				this.createOverlay();
+				this.isActive = true;
+				this.updateRibbonState();
+			}
+		});
 
 		// Add ribbon icon to toggle privacy screen
-		this.addRibbonIcon('eye-off', 'Toggle privacy screen', () => {
+		this.ribbonIconEl = this.addRibbonIcon('eye-off', 'Toggle privacy screen', () => {
 			this.toggle();
 		});
 
@@ -68,6 +75,10 @@ export default class PrivacyScreenPlugin extends Plugin {
 		this.addCommand({ id: 'decrease-blur', name: 'Decrease blur intensity', callback: () => this.adjustSetting('blurIntensity', -1, 2, 20) });
 		this.addCommand({ id: 'increase-offset', name: 'Increase horizontal offset', callback: () => this.adjustOffset(5) });
 		this.addCommand({ id: 'decrease-offset', name: 'Decrease horizontal offset', callback: () => this.adjustOffset(-5) });
+		this.addCommand({ id: 'increase-feather', name: 'Increase feather edge', callback: () => this.adjustSetting('featherEdge', 5, 10, 100) });
+		this.addCommand({ id: 'decrease-feather', name: 'Decrease feather edge', callback: () => this.adjustSetting('featherEdge', -5, 10, 100) });
+		this.addCommand({ id: 'increase-roundness', name: 'Increase corner roundness', callback: () => this.adjustSetting('squareRoundness', 5, 0, 100) });
+		this.addCommand({ id: 'decrease-roundness', name: 'Decrease corner roundness', callback: () => this.adjustSetting('squareRoundness', -5, 0, 100) });
 		this.addCommand({ id: 'reset-settings', name: 'Reset to default settings', callback: () => this.resetSettings() });
 		this.addCommand({ id: 'toggle-tracking-mode', name: 'Toggle tracking mode (cursor/mouse)', callback: () => this.toggleTrackingMode() });
 
@@ -81,15 +92,24 @@ export default class PrivacyScreenPlugin extends Plugin {
 			this.app.workspace.on('active-leaf-change', () => this.trackCursor())
 		);
 
-		// Mouse tracking mode
+		// Mouse tracking mode - coalesce to one mask recompute per frame
 		this.registerDomEvent(document, 'mousemove', (e: MouseEvent) => {
-			if (this.isActive && this.settings.trackingMode === 'mouse') {
-				this.updateSpotlightPosition(e.clientX, e.clientY);
+			if (!this.isActive || this.settings.trackingMode !== 'mouse') return;
+			this.pendingMouseX = e.clientX;
+			this.pendingMouseY = e.clientY;
+			if (this.mouseMoveRaf === null) {
+				this.mouseMoveRaf = requestAnimationFrame(() => {
+					this.mouseMoveRaf = null;
+					this.updateSpotlightPosition(this.pendingMouseX, this.pendingMouseY);
+				});
 			}
 		});
 	}
 
 	onunload() {
+		if (this.mouseMoveRaf !== null) {
+			cancelAnimationFrame(this.mouseMoveRaf);
+		}
 		this.removeOverlay();
 	}
 
@@ -110,13 +130,29 @@ export default class PrivacyScreenPlugin extends Plugin {
 		}
 		this.isActive = !this.isActive;
 		this.settings.wasActive = this.isActive;
+		this.updateRibbonState();
 		void this.saveSettings();
 	}
 
-	private adjustSetting(key: 'spotlightWidth' | 'spotlightHeight' | 'blurIntensity', delta: number, min: number, max: number) {
+	private updateRibbonState() {
+		if (!this.ribbonIconEl) return;
+		setIcon(this.ribbonIconEl, this.isActive ? 'eye' : 'eye-off');
+		this.ribbonIconEl.toggleClass('is-active', this.isActive);
+		this.ribbonIconEl.setAttribute('aria-label', this.isActive ? 'Privacy screen: on' : 'Privacy screen: off');
+	}
+
+	private adjustSetting(key: 'spotlightWidth' | 'spotlightHeight' | 'blurIntensity' | 'featherEdge' | 'squareRoundness', delta: number, min: number, max: number) {
 		const newValue = Math.max(min, Math.min(max, this.settings[key] + delta));
 		this.settings[key] = newValue;
+		if (key === 'spotlightWidth') {
+			this.settings.horizontalOffset = this.clampOffsetToWidth(newValue, this.settings.horizontalOffset);
+		}
 		void this.saveSettings();
+	}
+
+	clampOffsetToWidth(width: number, offset: number): number {
+		const maxOffset = Math.floor(width / 2) - 5;
+		return Math.max(-maxOffset, Math.min(maxOffset, offset));
 	}
 
 	private adjustOffset(delta: number) {
@@ -126,7 +162,7 @@ export default class PrivacyScreenPlugin extends Plugin {
 		void this.saveSettings();
 	}
 
-	private async resetSettings() {
+	async resetSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS);
 		await this.saveSettings();
 	}
@@ -170,6 +206,7 @@ export default class PrivacyScreenPlugin extends Plugin {
 		const y = this.currentY;
 		const rx = spotlightWidth / 2;
 		const ry = spotlightHeight / 2;
+		const ribbonCutout = this.getRibbonCutout();
 
 		let maskImage: string;
 
@@ -177,14 +214,21 @@ export default class PrivacyScreenPlugin extends Plugin {
 			case 'square': {
 				const minDimension = Math.min(rx, ry);
 				const roundness = (squareRoundness / 100) * minDimension;
-				maskImage = this.createSquareMask(x, y, spotlightWidth, spotlightHeight, roundness, featherEdge);
+				maskImage = this.createSquareMask(x, y, spotlightWidth, spotlightHeight, roundness, featherEdge, ribbonCutout);
 				break;
 			}
 			case 'circle':
 			default: {
 				const outerRx = rx + featherEdge;
 				const outerRy = ry + featherEdge;
-				maskImage = `radial-gradient(ellipse ${rx}px ${ry}px at ${x}px ${y}px, transparent 0%, transparent 100%, black 100%), radial-gradient(ellipse ${outerRx}px ${outerRy}px at ${x}px ${y}px, transparent 0%, black 100%)`;
+				const layers = [
+					`radial-gradient(ellipse ${rx}px ${ry}px at ${x}px ${y}px, transparent 0%, transparent 100%, black 100%)`,
+					`radial-gradient(ellipse ${outerRx}px ${outerRy}px at ${x}px ${y}px, transparent 0%, black 100%)`
+				];
+				if (ribbonCutout) {
+					layers.push(`radial-gradient(circle ${ribbonCutout.radius}px at ${ribbonCutout.cx}px ${ribbonCutout.cy}px, transparent 0%, transparent 100%, black 100%)`);
+				}
+				maskImage = layers.join(', ');
 				break;
 			}
 		}
@@ -192,7 +236,18 @@ export default class PrivacyScreenPlugin extends Plugin {
 		this.overlayEl.style.maskImage = maskImage;
 	}
 
-	private createSquareMask(cx: number, cy: number, width: number, height: number, roundness: number, feather: number): string {
+	private getRibbonCutout(): { cx: number; cy: number; radius: number } | null {
+		if (!this.ribbonIconEl) return null;
+		const rect = this.ribbonIconEl.getBoundingClientRect();
+		if (rect.width === 0 && rect.height === 0) return null;
+		return {
+			cx: rect.left + rect.width / 2,
+			cy: rect.top + rect.height / 2,
+			radius: Math.max(rect.width, rect.height) / 2 + 8
+		};
+	}
+
+	private createSquareMask(cx: number, cy: number, width: number, height: number, roundness: number, feather: number, ribbonCutout: { cx: number; cy: number; radius: number } | null): string {
 		const left = cx - width / 2;
 		const top = cy - height / 2;
 		const outerLeft = left - feather;
@@ -200,6 +255,9 @@ export default class PrivacyScreenPlugin extends Plugin {
 		const outerWidth = width + feather * 2;
 		const outerHeight = height + feather * 2;
 		const outerRoundness = roundness + feather;
+		const ribbonHole = ribbonCutout
+			? `<circle cx="${ribbonCutout.cx}" cy="${ribbonCutout.cy}" r="${ribbonCutout.radius}" fill="black"/>`
+			: '';
 
 		const svg = `
 			<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%">
@@ -208,6 +266,7 @@ export default class PrivacyScreenPlugin extends Plugin {
 						<rect width="100%" height="100%" fill="white"/>
 						<rect x="${outerLeft}" y="${outerTop}" width="${outerWidth}" height="${outerHeight}" rx="${outerRoundness}" fill="url(#fade)"/>
 						<rect x="${left}" y="${top}" width="${width}" height="${height}" rx="${roundness}" fill="black"/>
+						${ribbonHole}
 					</mask>
 					<radialGradient id="fade">
 						<stop offset="0%" stop-color="black"/>
@@ -223,6 +282,7 @@ export default class PrivacyScreenPlugin extends Plugin {
 
 	private trackCursor() {
 		if (!this.isActive) return;
+		if (this.settings.trackingMode === 'mouse') return;
 
 		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
 		if (!view) return;
@@ -251,6 +311,7 @@ export default class PrivacyScreenPlugin extends Plugin {
 		if (this.isActive) {
 			this.removeOverlay();
 			this.isActive = false;
+			this.updateRibbonState();
 		}
 	}
 
@@ -258,6 +319,7 @@ export default class PrivacyScreenPlugin extends Plugin {
 		if (this.wasActiveBeforePause && !this.isActive) {
 			this.createOverlay();
 			this.isActive = true;
+			this.updateRibbonState();
 		}
 	}
 }
@@ -270,6 +332,46 @@ class PrivacyScreenSettingTab extends PluginSettingTab {
 	constructor(app: App, plugin: PrivacyScreenPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
+	}
+
+	private addSliderWithInput(
+		containerEl: HTMLElement,
+		opts: { name: string; desc: string; min: number; max: number; step: number; value: number; onChange: (value: number) => void | Promise<void> }
+	): void {
+		let sliderComponent: SliderComponent | undefined;
+		let textComponent: TextComponent | undefined;
+
+		new Setting(containerEl)
+			.setName(opts.name)
+			.setDesc(opts.desc)
+			.addSlider(slider => {
+				sliderComponent = slider;
+				slider
+					.setLimits(opts.min, opts.max, opts.step)
+					.setValue(opts.value)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						textComponent?.setValue(String(value));
+						await opts.onChange(value);
+					});
+			})
+			.addText(text => {
+				textComponent = text;
+				text.inputEl.type = 'number';
+				text.inputEl.addClass('privacy-number-input');
+				text
+					.setValue(String(opts.value))
+					.onChange(async (raw) => {
+						const parsed = Number(raw);
+						if (Number.isNaN(parsed)) return;
+						const clamped = Math.min(opts.max, Math.max(opts.min, parsed));
+						sliderComponent?.setValue(clamped);
+						if (clamped !== parsed) {
+							text.setValue(String(clamped));
+						}
+						await opts.onChange(clamped);
+					});
+			});
 	}
 
 	display(): void {
@@ -288,77 +390,76 @@ class PrivacyScreenSettingTab extends PluginSettingTab {
 		}
 		this.updatePreview();
 
-		new Setting(containerEl)
-			.setName('Spotlight width')
-			.setDesc('Width of the clear area (in pixels)')
-			.addSlider(slider => slider
-				.setLimits(24, 600, 10)
-				.setValue(this.plugin.settings.spotlightWidth)
-				.setDynamicTooltip()
-				.onChange(async (value) => {
-					this.plugin.settings.spotlightWidth = value;
-					// Clamp offset if it exceeds new limits
-					const maxOffset = Math.floor(value / 2) - 5;
-					if (this.plugin.settings.horizontalOffset > maxOffset) {
-						this.plugin.settings.horizontalOffset = maxOffset;
-					} else if (this.plugin.settings.horizontalOffset < -maxOffset) {
-						this.plugin.settings.horizontalOffset = -maxOffset;
-					}
-					await this.plugin.saveSettings();
-					this.display();
-				}));
+		this.addSliderWithInput(containerEl, {
+			name: 'Spotlight width',
+			desc: 'Width of the clear area (in pixels)',
+			min: 24,
+			max: 600,
+			step: 10,
+			value: this.plugin.settings.spotlightWidth,
+			onChange: async (value) => {
+				this.plugin.settings.spotlightWidth = value;
+				this.plugin.settings.horizontalOffset = this.plugin.clampOffsetToWidth(value, this.plugin.settings.horizontalOffset);
+				await this.plugin.saveSettings();
+				this.display();
+			}
+		});
 
 		// Dynamic offset limits based on width
 		const maxOffset = Math.floor(this.plugin.settings.spotlightWidth / 2) - 5;
-		new Setting(containerEl)
-			.setName('Horizontal offset')
-			.setDesc('Shift spotlight left (-) or right (+) relative to cursor')
-			.addSlider(slider => slider
-				.setLimits(-maxOffset, maxOffset, 1)
-				.setValue(this.plugin.settings.horizontalOffset)
-				.setDynamicTooltip()
-				.onChange(async (value) => {
-					this.plugin.settings.horizontalOffset = value;
-					await this.plugin.saveSettings();
-					this.updatePreview();
-				}));
+		this.addSliderWithInput(containerEl, {
+			name: 'Horizontal offset',
+			desc: 'Shift spotlight left (-) or right (+) relative to cursor',
+			min: -maxOffset,
+			max: maxOffset,
+			step: 1,
+			value: this.plugin.settings.horizontalOffset,
+			onChange: async (value) => {
+				this.plugin.settings.horizontalOffset = value;
+				await this.plugin.saveSettings();
+				this.updatePreview();
+			}
+		});
 
-		new Setting(containerEl)
-			.setName('Spotlight height')
-			.setDesc('Height of the clear area (in pixels)')
-			.addSlider(slider => slider
-				.setLimits(24, 600, 10)
-				.setValue(this.plugin.settings.spotlightHeight)
-				.setDynamicTooltip()
-				.onChange(async (value) => {
-					this.plugin.settings.spotlightHeight = value;
-					await this.plugin.saveSettings();
-					this.updatePreview();
-				}));
+		this.addSliderWithInput(containerEl, {
+			name: 'Spotlight height',
+			desc: 'Height of the clear area (in pixels)',
+			min: 24,
+			max: 600,
+			step: 10,
+			value: this.plugin.settings.spotlightHeight,
+			onChange: async (value) => {
+				this.plugin.settings.spotlightHeight = value;
+				await this.plugin.saveSettings();
+				this.updatePreview();
+			}
+		});
 
-		new Setting(containerEl)
-			.setName('Blur intensity')
-			.setDesc('How blurry the surrounding area should be (in pixels)')
-			.addSlider(slider => slider
-				.setLimits(2, 20, 1)
-				.setValue(this.plugin.settings.blurIntensity)
-				.setDynamicTooltip()
-				.onChange(async (value) => {
-					this.plugin.settings.blurIntensity = value;
-					await this.plugin.saveSettings();
-				}));
+		this.addSliderWithInput(containerEl, {
+			name: 'Blur intensity',
+			desc: 'How blurry the surrounding area should be (in pixels)',
+			min: 2,
+			max: 20,
+			step: 1,
+			value: this.plugin.settings.blurIntensity,
+			onChange: async (value) => {
+				this.plugin.settings.blurIntensity = value;
+				await this.plugin.saveSettings();
+			}
+		});
 
-		new Setting(containerEl)
-			.setName('Feather edge')
-			.setDesc('Softness of the spotlight edge (in pixels)')
-			.addSlider(slider => slider
-				.setLimits(10, 100, 5)
-				.setValue(this.plugin.settings.featherEdge)
-				.setDynamicTooltip()
-				.onChange(async (value) => {
-					this.plugin.settings.featherEdge = value;
-					await this.plugin.saveSettings();
-				}));
+		this.addSliderWithInput(containerEl, {
+			name: 'Feather edge',
+			desc: 'Softness of the spotlight edge (in pixels)',
+			min: 10,
+			max: 100,
+			step: 5,
+			value: this.plugin.settings.featherEdge,
+			onChange: async (value) => {
+				this.plugin.settings.featherEdge = value;
+				await this.plugin.saveSettings();
+			}
+		});
 
 		new Setting(containerEl)
 			.setName('Spotlight shape')
@@ -374,18 +475,19 @@ class PrivacyScreenSettingTab extends PluginSettingTab {
 				}));
 
 		if (this.plugin.settings.spotlightShape === 'square') {
-			new Setting(containerEl)
-				.setName('Corner roundness')
-				.setDesc('Roundness of square corners (0 = sharp, 100 = circular)')
-				.addSlider(slider => slider
-					.setLimits(0, 100, 5)
-					.setValue(this.plugin.settings.squareRoundness)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.squareRoundness = value;
-						await this.plugin.saveSettings();
-						this.updatePreview();
-					}));
+			this.addSliderWithInput(containerEl, {
+				name: 'Corner roundness',
+				desc: 'Roundness of square corners (0 = sharp, 100 = circular)',
+				min: 0,
+				max: 100,
+				step: 5,
+				value: this.plugin.settings.squareRoundness,
+				onChange: async (value) => {
+					this.plugin.settings.squareRoundness = value;
+					await this.plugin.saveSettings();
+					this.updatePreview();
+				}
+			});
 		}
 
 		new Setting(containerEl)
@@ -408,6 +510,17 @@ class PrivacyScreenSettingTab extends PluginSettingTab {
 				.onChange(async (value) => {
 					this.plugin.settings.previewCursorBlink = value;
 					await this.plugin.saveSettings();
+					this.display();
+				}));
+
+		new Setting(containerEl)
+			.setName('Reset to defaults')
+			.setDesc('Reset all settings above to their default values')
+			.addButton(button => button
+				.setButtonText('Reset')
+				.setWarning()
+				.onClick(async () => {
+					await this.plugin.resetSettings();
 					this.display();
 				}));
 	}

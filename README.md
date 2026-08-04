@@ -54,8 +54,18 @@ All commands can be bound to hotkeys in Settings > Hotkeys:
 - Increase/Decrease spotlight height
 - Increase/Decrease blur intensity
 - Increase/Decrease horizontal offset
+- Increase/Decrease feather edge
+- Increase/Decrease corner roundness
 - Toggle tracking mode (cursor/mouse)
 - Reset to default settings
+
+## Known limitations
+
+- Text-cursor tracking reads the editor's cursor position through an
+  undocumented CodeMirror 6 internal (`editor.cm`), since Obsidian doesn't
+  expose a public API for this. If a future Obsidian update changes that
+  internal, cursor tracking could stop working until the plugin is updated —
+  mouse tracking mode doesn't depend on it and is unaffected.
 
 ## Acknowledgements 
 
