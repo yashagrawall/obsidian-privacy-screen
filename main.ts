@@ -34,11 +34,15 @@ export default class PrivacyScreenPlugin extends Plugin {
 	settings: PrivacyScreenSettings;
 	private overlayEl: HTMLElement | null = null;
 	private isActive: boolean = false;
+	private isPaused: boolean = false;
 	private wasActiveBeforePause: boolean = false;
 	private ribbonIconEl: HTMLElement | null = null;
 	private pendingMouseX: number = 0;
 	private pendingMouseY: number = 0;
 	private mouseMoveRaf: number | null = null;
+	private cursorMoveRaf: number | null = null;
+	private currentX: number = typeof window !== 'undefined' ? window.innerWidth / 2 : 0;
+	private currentY: number = typeof window !== 'undefined' ? window.innerHeight / 2 : 0;
 
 	async onload() {
 		await this.loadSettings();
@@ -85,18 +89,26 @@ export default class PrivacyScreenPlugin extends Plugin {
 		// Add settings tab
 		this.addSettingTab(new PrivacyScreenSettingTab(this.app, this));
 
-		// Track cursor position via various events
-		this.registerDomEvent(document, 'keyup', () => this.trackCursor());
-		this.registerDomEvent(document, 'click', () => this.trackCursor());
+		// Register events for text cursor tracking
+		this.registerDomEvent(document, 'keyup', () => this.scheduleTrackCursor());
+		this.registerDomEvent(document, 'keydown', () => this.scheduleTrackCursor());
+		this.registerDomEvent(document, 'click', () => this.scheduleTrackCursor());
+		this.registerDomEvent(document, 'selectionchange', () => this.scheduleTrackCursor());
+		this.registerDomEvent(document, 'scroll', () => this.scheduleTrackCursor(), { capture: true });
 		this.registerEvent(
-			this.app.workspace.on('active-leaf-change', () => this.trackCursor())
+			this.app.workspace.on('active-leaf-change', () => this.scheduleTrackCursor())
+		);
+		this.registerEvent(
+			this.app.workspace.on('editor-change', () => this.scheduleTrackCursor())
 		);
 
 		// Mouse tracking mode - coalesce to one mask recompute per frame
 		this.registerDomEvent(document, 'mousemove', (e: MouseEvent) => {
-			if (!this.isActive || this.settings.trackingMode !== 'mouse') return;
 			this.pendingMouseX = e.clientX;
 			this.pendingMouseY = e.clientY;
+
+			if (!this.isActive || this.settings.trackingMode !== 'mouse') return;
+
 			if (this.mouseMoveRaf === null) {
 				this.mouseMoveRaf = requestAnimationFrame(() => {
 					this.mouseMoveRaf = null;
@@ -109,6 +121,11 @@ export default class PrivacyScreenPlugin extends Plugin {
 	onunload() {
 		if (this.mouseMoveRaf !== null) {
 			cancelAnimationFrame(this.mouseMoveRaf);
+			this.mouseMoveRaf = null;
+		}
+		if (this.cursorMoveRaf !== null) {
+			cancelAnimationFrame(this.cursorMoveRaf);
+			this.cursorMoveRaf = null;
 		}
 		this.removeOverlay();
 	}
@@ -125,10 +142,11 @@ export default class PrivacyScreenPlugin extends Plugin {
 	private toggle() {
 		if (this.isActive) {
 			this.removeOverlay();
+			this.isActive = false;
 		} else {
 			this.createOverlay();
+			this.isActive = true;
 		}
-		this.isActive = !this.isActive;
 		this.settings.wasActive = this.isActive;
 		this.updateRibbonState();
 		void this.saveSettings();
@@ -170,19 +188,28 @@ export default class PrivacyScreenPlugin extends Plugin {
 	private toggleTrackingMode() {
 		this.settings.trackingMode = this.settings.trackingMode === 'cursor' ? 'mouse' : 'cursor';
 		void this.saveSettings();
+		if (this.isActive) {
+			if (this.settings.trackingMode === 'cursor') {
+				this.trackCursor();
+			} else {
+				this.updateSpotlightPosition(this.pendingMouseX, this.pendingMouseY);
+			}
+		}
 	}
 
 	private createOverlay() {
+		if (this.overlayEl) return;
 		this.overlayEl = document.createElement('div');
 		this.overlayEl.addClass('privacy-screen-overlay');
 		document.body.appendChild(this.overlayEl);
 
 		this.applySettings();
-		this.trackCursor();
+		if (this.settings.trackingMode === 'cursor') {
+			this.trackCursor();
+		} else {
+			this.updateSpotlightPosition(this.pendingMouseX, this.pendingMouseY);
+		}
 	}
-
-	private currentX: number = 0;
-	private currentY: number = 0;
 
 	private applySettings() {
 		if (!this.overlayEl) return;
@@ -202,38 +229,52 @@ export default class PrivacyScreenPlugin extends Plugin {
 		if (!this.overlayEl) return;
 
 		const { spotlightWidth, spotlightHeight, horizontalOffset, featherEdge, spotlightShape, squareRoundness } = this.settings;
-		const x = this.currentX + horizontalOffset;
-		const y = this.currentY;
+		const cx = this.currentX + horizontalOffset;
+		const cy = this.currentY;
 		const rx = spotlightWidth / 2;
 		const ry = spotlightHeight / 2;
 		const ribbonCutout = this.getRibbonCutout();
 
-		let maskImage: string;
+		const ribbonCutoutSvg = ribbonCutout
+			? `<circle cx="${ribbonCutout.cx}" cy="${ribbonCutout.cy}" r="${ribbonCutout.radius}" fill="black"/>`
+			: '';
 
-		switch (spotlightShape) {
-			case 'square': {
-				const minDimension = Math.min(rx, ry);
-				const roundness = (squareRoundness / 100) * minDimension;
-				maskImage = this.createSquareMask(x, y, spotlightWidth, spotlightHeight, roundness, featherEdge, ribbonCutout);
-				break;
-			}
-			case 'circle':
-			default: {
-				const outerRx = rx + featherEdge;
-				const outerRy = ry + featherEdge;
-				const layers = [
-					`radial-gradient(ellipse ${rx}px ${ry}px at ${x}px ${y}px, transparent 0%, transparent 100%, black 100%)`,
-					`radial-gradient(ellipse ${outerRx}px ${outerRy}px at ${x}px ${y}px, transparent 0%, black 100%)`
-				];
-				if (ribbonCutout) {
-					layers.push(`radial-gradient(circle ${ribbonCutout.radius}px at ${ribbonCutout.cx}px ${ribbonCutout.cy}px, transparent 0%, transparent 100%, black 100%)`);
-				}
-				maskImage = layers.join(', ');
-				break;
-			}
+		let featherDef = '';
+		let filterAttr = '';
+		if (featherEdge > 0) {
+			const stdDev = (featherEdge / 2).toFixed(1);
+			featherDef = `<filter id="feather" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="${stdDev}"/></filter>`;
+			filterAttr = `filter="url(#feather)"`;
 		}
 
-		this.overlayEl.style.maskImage = maskImage;
+		let shapeSvg = '';
+		if (spotlightShape === 'square') {
+			const minDimension = Math.min(rx, ry);
+			const roundness = (squareRoundness / 100) * minDimension;
+			const left = cx - rx;
+			const top = cy - ry;
+			shapeSvg = `<rect x="${left}" y="${top}" width="${spotlightWidth}" height="${spotlightHeight}" rx="${roundness}" ry="${roundness}" fill="black" ${filterAttr}/>`;
+		} else {
+			shapeSvg = `<ellipse cx="${cx}" cy="${cy}" rx="${rx}" ry="${ry}" fill="black" ${filterAttr}/>`;
+		}
+
+		const svgContent = `
+			<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%">
+				<defs>
+					${featherDef}
+					<mask id="privacy-mask">
+						<rect width="100%" height="100%" fill="white"/>
+						${shapeSvg}
+						${ribbonCutoutSvg}
+					</mask>
+				</defs>
+				<rect width="100%" height="100%" fill="black" mask="url(#privacy-mask)"/>
+			</svg>
+		`.replace(/\s+/g, ' ').trim();
+
+		const maskUrl = `url("data:image/svg+xml,${encodeURIComponent(svgContent)}")`;
+		this.overlayEl.style.maskImage = maskUrl;
+		(this.overlayEl.style as any).webkitMaskImage = maskUrl;
 	}
 
 	private getRibbonCutout(): { cx: number; cy: number; radius: number } | null {
@@ -247,56 +288,46 @@ export default class PrivacyScreenPlugin extends Plugin {
 		};
 	}
 
-	private createSquareMask(cx: number, cy: number, width: number, height: number, roundness: number, feather: number, ribbonCutout: { cx: number; cy: number; radius: number } | null): string {
-		const left = cx - width / 2;
-		const top = cy - height / 2;
-		const outerLeft = left - feather;
-		const outerTop = top - feather;
-		const outerWidth = width + feather * 2;
-		const outerHeight = height + feather * 2;
-		const outerRoundness = roundness + feather;
-		const ribbonHole = ribbonCutout
-			? `<circle cx="${ribbonCutout.cx}" cy="${ribbonCutout.cy}" r="${ribbonCutout.radius}" fill="black"/>`
-			: '';
-
-		const svg = `
-			<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%">
-				<defs>
-					<mask id="spotlight">
-						<rect width="100%" height="100%" fill="white"/>
-						<rect x="${outerLeft}" y="${outerTop}" width="${outerWidth}" height="${outerHeight}" rx="${outerRoundness}" fill="url(#fade)"/>
-						<rect x="${left}" y="${top}" width="${width}" height="${height}" rx="${roundness}" fill="black"/>
-						${ribbonHole}
-					</mask>
-					<radialGradient id="fade">
-						<stop offset="0%" stop-color="black"/>
-						<stop offset="100%" stop-color="white"/>
-					</radialGradient>
-				</defs>
-				<rect width="100%" height="100%" fill="black" mask="url(#spotlight)"/>
-			</svg>
-		`.replace(/\s+/g, ' ').trim();
-
-		return `url("data:image/svg+xml,${encodeURIComponent(svg)}")`;
+	private scheduleTrackCursor() {
+		if (!this.isActive || this.settings.trackingMode === 'mouse') return;
+		if (this.cursorMoveRaf === null) {
+			this.cursorMoveRaf = requestAnimationFrame(() => {
+				this.cursorMoveRaf = null;
+				this.trackCursor();
+			});
+		}
 	}
 
 	private trackCursor() {
-		if (!this.isActive) return;
-		if (this.settings.trackingMode === 'mouse') return;
+		if (!this.isActive || this.settings.trackingMode === 'mouse') return;
 
 		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (!view) return;
+		if (!view || !view.editor) return;
 
-		// @ts-ignore - accessing internal CM6 editor
-		const editorView: EditorView = view.editor.cm;
-		if (!editorView) return;
+		let coords: { left: number; top: number; bottom: number } | null = null;
 
-		const cursorPos = editorView.state.selection.main.head;
-		const coords = editorView.coordsAtPos(cursorPos);
-		if (!coords) return;
+		if (typeof (view.editor as any).cursorCoords === 'function') {
+			try {
+				coords = (view.editor as any).cursorCoords(true, 'window');
+			} catch (e) {
+				coords = null;
+			}
+		}
 
-		const centerY = (coords.top + coords.bottom) / 2;
-		this.updateSpotlightPosition(coords.left, centerY);
+		if (!coords && (view.editor as any).cm) {
+			try {
+				const editorView: EditorView = (view.editor as any).cm;
+				const cursorPos = editorView.state.selection.main.head;
+				coords = editorView.coordsAtPos(cursorPos);
+			} catch (e) {
+				coords = null;
+			}
+		}
+
+		if (coords) {
+			const centerY = (coords.top + coords.bottom) / 2;
+			this.updateSpotlightPosition(coords.left, centerY);
+		}
 	}
 
 	private removeOverlay() {
@@ -307,7 +338,10 @@ export default class PrivacyScreenPlugin extends Plugin {
 	}
 
 	pauseOverlay() {
-		this.wasActiveBeforePause = this.isActive;
+		if (!this.isPaused) {
+			this.wasActiveBeforePause = this.isActive;
+			this.isPaused = true;
+		}
 		if (this.isActive) {
 			this.removeOverlay();
 			this.isActive = false;
@@ -316,10 +350,15 @@ export default class PrivacyScreenPlugin extends Plugin {
 	}
 
 	resumeOverlay() {
-		if (this.wasActiveBeforePause && !this.isActive) {
-			this.createOverlay();
-			this.isActive = true;
-			this.updateRibbonState();
+		if (this.isPaused) {
+			const shouldResume = this.wasActiveBeforePause;
+			this.isPaused = false;
+			this.wasActiveBeforePause = false;
+			if (shouldResume && !this.isActive) {
+				this.createOverlay();
+				this.isActive = true;
+				this.updateRibbonState();
+			}
 		}
 	}
 }

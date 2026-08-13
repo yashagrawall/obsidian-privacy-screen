@@ -11,6 +11,7 @@
 
 	backdrop-filter: blur(var(--blur-intensity));
 	-webkit-backdrop-filter: blur(var(--blur-intensity));
+	will-change: mask-image, -webkit-mask-image;
 }
 
 .privacy-preview-container {
